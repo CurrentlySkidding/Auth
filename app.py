@@ -1,21 +1,24 @@
-
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta
 import jwt
-import uuid
 import hashlib
 from pydantic import BaseModel
 from typing import Optional
+import os
 import uvicorn
-import aiosqlite
 
-# Database setup
-SQLALCHEMY_DATABASE_URL = "sqlite:///./auth.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+# Database setup - Use PostgreSQL on Render, SQLite locally
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./auth.db")
+
+# If using PostgreSQL on Render, need to adjust the URL
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -66,7 +69,7 @@ class RegisterRequest(BaseModel):
     license_key: str
 
 # JWT configuration
-SECRET_KEY = "your-secret-key-change-in-production"
+SECRET_KEY = os.environ.get("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -79,12 +82,9 @@ def get_db():
         db.close()
 
 # Helper functions
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+def create_access_token(data: dict):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -100,7 +100,7 @@ def hash_hwid(hwid: str) -> str:
     return hashlib.sha256(hwid.encode()).hexdigest()
 
 # Routes
-@app.post("/api/auth", response_model=AuthResponse)
+@app.post("/api/auth")
 async def authenticate(request: AuthRequest, db: Session = Depends(get_db)):
     """Authenticate user with license key, HWID, and IP"""
     
@@ -113,9 +113,11 @@ async def authenticate(request: AuthRequest, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="License is deactivated")
     
+    hashed_hwid = hash_hwid(request.hwid)
+    
     # If it's first login, register HWID and IP
     if not user.hwid:
-        user.hwid = hash_hwid(request.hwid)
+        user.hwid = hashed_hwid
         user.ip_address = request.ip_address
         user.last_login = datetime.utcnow()
         user.total_logins = 1
@@ -129,21 +131,16 @@ async def authenticate(request: AuthRequest, db: Session = Depends(get_db)):
         }
         token = create_access_token(token_data)
         
-        return AuthResponse(
-            status=True,
-            message="HWID registered successfully",
-            token=token,
-            license_key=request.license_key
-        )
+        return {
+            "status": True,
+            "message": "HWID registered successfully",
+            "token": token,
+            "license_key": request.license_key
+        }
     
     # Check if HWID matches
-    hashed_hwid = hash_hwid(request.hwid)
     if user.hwid != hashed_hwid:
         raise HTTPException(status_code=403, detail="HWID mismatch")
-    
-    # Check if IP matches (optional, can be made strict)
-    if user.ip_address and user.ip_address != request.ip_address:
-        raise HTTPException(status_code=403, detail="IP address mismatch")
     
     # Update login info
     user.last_login = datetime.utcnow()
@@ -158,14 +155,14 @@ async def authenticate(request: AuthRequest, db: Session = Depends(get_db)):
     }
     token = create_access_token(token_data)
     
-    return AuthResponse(
-        status=True,
-        message="Authentication successful",
-        token=token,
-        license_key=request.license_key
-    )
+    return {
+        "status": True,
+        "message": "Authentication successful",
+        "token": token,
+        "license_key": request.license_key
+    }
 
-@app.post("/api/validate", response_model=dict)
+@app.post("/api/validate")
 async def validate_token(request: ValidateRequest):
     """Validate JWT token"""
     payload = verify_token(request.token)
@@ -180,7 +177,7 @@ async def validate_token(request: ValidateRequest):
         "hwid": payload.get("hwid")
     }
 
-@app.post("/api/register", response_model=dict)
+@app.post("/api/register")
 async def register_license(request: RegisterRequest, db: Session = Depends(get_db)):
     """Register a new license key (admin function)"""
     
@@ -205,7 +202,7 @@ async def register_license(request: RegisterRequest, db: Session = Depends(get_d
         "license_key": request.license_key
     }
 
-@app.get("/api/check/{license_key}", response_model=dict)
+@app.get("/api/check/{license_key}")
 async def check_license(license_key: str, db: Session = Depends(get_db)):
     """Check license status"""
     user = db.query(User).filter(User.license_key == license_key).first()
@@ -239,6 +236,7 @@ async def root():
         ]
     }
 
-# For Flask compatibility (if needed)
+# For Render deployment
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
